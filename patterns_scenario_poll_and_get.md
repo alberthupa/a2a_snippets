@@ -1,102 +1,40 @@
-# Choosing an A2A pattern for 10‑minute jobs
+# Choosing an A2A pattern for ~10 minute jobs
 
-**Scenario**: a *requester* agent kicks off a job it knows takes **≈10 minutes** on a *worker* agent and wants to be notified when done.
+**Scenario** – A *requester* agent delegates a task that takes **about ten minutes** to a *worker* agent and wants to know (nothing more, nothing less) when the job is done.
 
+Three coordination patterns cover almost every situation:
 
-https://chatgpt.com/c/6867c5e1-77bc-800a-9b8f-4912dd041ce3
+| # | Pattern                       | Short description                                  | Best when…                                     |
+|---|------------------------------|----------------------------------------------------|------------------------------------------------|
+| 1 | **Poll + Get**               | Requester polls `/tasks/get` until state = DONE    | Any network; simplest synchronous code         |
+| 2 | **Subscribe / Server-push**  | Requester opens one stream; worker pushes updates  | Long-lived TCP streams survive ~10 min         |
+| 3 | **Callback**                 | Worker calls requester’s own `/tasks/send`         | You already run A2A on **both** sides          |
 
----
+### Trade-offs at a glance
 
-## 1. Poll + Get
+| Aspect                | Poll + Get                                    | Subscribe / Server-push                    | Callback                                  |
+|-----------------------|-----------------------------------------------|--------------------------------------------|-------------------------------------------|
+| **Network chatter**   | `ceil(job_time / interval)` round-trips       | One persistent stream                      | Zero until final callback                 |
+| **Notification lag**  | ≤ poll interval (e.g. 30 s)                   | Milliseconds                               | Milliseconds                              |
+| **Code complexity**   | Works with plain blocking HTTP clients        | Needs async client & keep-alive pings      | Requester must expose an authenticated API|
+| **Robustness**        | Survives proxies & firewalls                  | Can be killed by strict proxies            | Requires mutual trust & inbound firewall  |
 
-| Aspect              | Polling (`/tasks/send` + periodic `/tasks/get`)                                                 |
-| ------------------- | ----------------------------------------------------------------------------------------------- |
-| **Network**         | `N = ceil(job_time / interval)` round‑trips. For a 10‑minute job at 30 s cadence → 20 requests. |
-| **Latency to know** | *At most* the poll interval (e.g. 30 s).                                                        |
-| **Simplicity**      | Works with plain synchronous code. No server‑side push needed.                                  |
-| **Robustness**      | Resilient if firewalls/proxies block long‑lived connections; each request re‑authenticates.     |
-| **Downsides**       | Wastes traffic & CPU when thousands of concurrent tasks; longer interval ⇒ slower notice.       |
+### Quick recommendation
 
-### Code sketch
-
-*Worker*: background thread updates `self.tasks` when done.
-*Requester*: loop `while state != COMPLETED: sleep(interval); get_task()`.
-
----
-
-## 2. Subscribe / Server‑push
-
-| Aspect              | Subscribe (`/tasks/subscribe`)                                                 |
-| ------------------- | ------------------------------------------------------------------------------ |
-| **Network**         | One long‑lived HTTP/2 or WS stream. Practically zero chatter until completion. |
-| **Latency to know** | Near‑instant (milliseconds) once the worker publishes.                         |
-| **Simplicity**      | Requires async IO on requester; worker must call `publisher.publish(task)`.    |
-| **Robustness**      | May be blocked by strict proxies; must keep connection alive \~10 min.         |
-| **Downsides**       | Each open stream ties up server memory; need keep‑alive pings or SSE.          |
-
-### Code sketch
-
-*Worker*: `asyncio.create_task(_finish())`, then `await publisher.publish(task)` after sleep.
-*Requester*: `async for update in client.subscribe_task(task_id): ...`.
+* **Subscribe** – if both agents can keep a single stream open for ten minutes.  
+* **Polling** – if you’re on flaky corporate networks or a CLI requester.  
+* **Callback** – if every agent is already an A2A server and you want full decoupling.
 
 ---
 
-## 3. Callback (Worker → Requester)
+## Method-specific introductions
 
-* Worker, once done, issues **a new A2A request back to the requester’s own endpoint**.
-* Pros: requester needn’t stay connected; natural fit for chained workflows.
-* Cons: requester must expose an endpoint & auth token; cycles of mutual trust.
+### 1 · Poll + Get — “Are we there yet?”
 
----
+The requester fires off the task (`/tasks/send`) and stores the returned `task_id`.  
+A simple loop then sleeps for *N* seconds and calls `/tasks/get task_id`.  
+Because each HTTP call is short-lived and re-authenticates, this pattern works everywhere—laptops on coffee-shop Wi-Fi, corporate proxies, even cron jobs—at the cost of extra traffic and up-to-N-seconds delay in noticing completion.
 
-## Recommendation
-
-| Environment                                                                 | Pick                                                       |
-| --------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| **Both agents can keep a 10‑min stream open** (same LAN, no proxy timeouts) | **Subscribe** — immediate notification, least chatter.     |
-| **Uncertain network / simple client**                                       | **Polling** at a moderate interval (e.g., 30–60 s).        |
-| **Requester is itself an A2A server** and you want full decoupling          | **Callback** chain: worker `tasks/send` back to requester. |
-
-For most cloud or container setups where idle TCP streams survive 10 minutes, *subscribe* gives the best user experience. If you’re on flaky corporate networks or CLI environments, stick to *polling*. If you’re orchestrating multi‑step agent pipelines, consider the *callback* pattern.
-
-
----
-
-*As i understand, if a requester sends a task, he waits for response from worker, what may take some time. And what if I have a requester who must send tasks to various workers And not wait for immediate response*
-
-
-You don’t have to wait synchronously for each worker—you can “fire and forget” and collect the answers later.  Three common ways to structure it:
-
-| Pattern                         | How the requester behaves                                                                                                                                                                  | When it shines                                                                                                                                                                                                 |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Fan-out + polling**           | Loop over all worker URLs<br>`_send_task()` → store each `task_id`<br>Start a timer (or background thread/async task) that polls every N seconds for every ID.                             | Very simple code; works anywhere HTTP is allowed.  Good when you have a few dozen jobs or can tolerate a 30--60 s delay.                                                                                       |
-| **Fan-out + subscribe streams** | For each worker, open an async `subscribe_task()` stream and add it to an `asyncio.gather()` list.  Your main coroutine just awaits all streams; each one pushes when the worker finishes. | Instant notification and no wasted polling traffic.  Ideal if you already run an asyncio loop and the network keeps long-lived connections alive.                                                              |
-| **Callback chain**              | Each worker, when done, calls **your** requester’s own A2A endpoint (`/tasks/send`) with the result.  Your requester is itself an A2A server.                                              | Best for high fan-out (hundreds/thousands).  The requester doesn’t need to keep connections open or poll; everything is event-driven.  Requires mutual auth/trust and that the requester exposes an HTTP port. |
-
-**Typical recipe**
-
-```text
-for worker in workers:                 # fan-out
-    task = client._create_task(...)    # describe work
-    task = client._send_task(task)     # returns immediately
-    store[worker] = task.id            # remember where to look later
-
-# later – either:
-#  1) poll each store[worker] in a loop
-#  2) await subscribe_task() streams
-#  3) accept callbacks on your own /tasks/send
-```
-
-**Rule of thumb**
-
-* *Do you control both sides and can keep a 10-minute TCP stream?* → **subscribe** (lowest latency, no polling).
-* *Behind proxies or very simple CLI requester?* → **polling** every 30-60 s.
-* *Running a pipeline where every agent is already an A2A server?* → **callback** so workers push results back.
-
-All three integrate cleanly with the minimal skeletons in the canvas—you just duplicate the send logic across the list of worker URLs and choose one collection strategy.
-
-
-## Scenario poll and get for long tasks:
 
 ### Worker
 
@@ -145,13 +83,13 @@ while task.status.state != TaskState.COMPLETED:
 print(task.artifacts[0]["parts"][0]["text"])
 ```
 
-## Scenario Subscribe / Server‑push
+---
 
-### Worker
+### 2 · Subscribe / Server-push — “Just ping me”
 
+When the network allows an HTTP/2, WebSocket, or SSE stream to stay up for the whole ten-minute job, the requester can simply **subscribe** once and wait.  
+The worker emits zero bytes until something changes, then streams one or more task updates ending with the *COMPLETED* state—so the requester hears “done” almost instantly and never wastes a poll.
 
-
-### Requester
 
 ```python
 import asyncio, copy, json
