@@ -36,7 +36,7 @@ A simple loop then sleeps for *N* seconds and calls `/tasks/get task_id`.
 Because each HTTP call is short-lived and re-authenticates, this pattern works everywhere—laptops on coffee-shop Wi-Fi, corporate proxies, even cron jobs—at the cost of extra traffic and up-to-N-seconds delay in noticing completion.
 
 
-### Worker
+#### Worker
 
 ```python
     def _finish(self, task_id: str, secs: int):
@@ -57,7 +57,7 @@ Because each HTTP call is short-lived and re-authenticates, this pattern works e
 ```
 
 
-### Requester
+#### Requester
 ```python
 import time
 from python_a2a import (
@@ -90,6 +90,7 @@ print(task.artifacts[0]["parts"][0]["text"])
 When the network allows an HTTP/2, WebSocket, or SSE stream to stay up for the whole ten-minute job, the requester can simply **subscribe** once and wait.  
 The worker emits zero bytes until something changes, then streams one or more task updates ending with the *COMPLETED* state—so the requester hears “done” almost instantly and never wastes a poll.
 
+#### Worker
 
 ```python
 import asyncio, copy, json
@@ -174,7 +175,7 @@ def setup_routes(self, app):
 ```
 
 
-### Requester
+#### Requester
 
 ```python
 import asyncio, uuid
@@ -205,4 +206,196 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
+
+
+#### 3 · Callback
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Registry
+    participant Worker
+    participant Requester
+
+    Client->>+Registry: Find best agent
+    Registry-->>-Client: Return worker agent URL
+
+    Client->>+Worker: Send Task(Message) with callback URL
+    Worker-->>-Client: Acknowledge Task (status: WAITING)
+
+    Note over Worker: Process long-running task...
+
+    Worker->>+Requester: Send completed Task(Message, Artifacts) to callback URL
+    Reques
+```
+
+
+#### Client
+
+
+
+
+```python
+import os
+import uuid
+import requests
+from python_a2a import Message, TextContent, MessageRole, Task
+from dotenv import load_dotenv
+
+load_dotenv(".env", override=True)
+REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
+
+
+def find_best_agent(registry_url, query):
+    """Finds the best agent for a given query."""
+    response = requests.get(f"{registry_url}/registry/agents")
+    response.raise_for_status()
+    agents = response.json()
+
+    # This is a simplified stand-in for the LLM-based routing logic.
+    # In a real scenario, you would call the routing logic from the original script.
+    # For this example, we'll just find an agent that doesn't have the name "requester".
+    for agent in agents:
+        if "requester" not in agent.get("name", "").lower():
+            return agent["name"], agent["url"]
+    raise RuntimeError("Could not find a suitable worker agent.")
+
+
+def main():
+    # --- Requester Setup ---
+    # This would be the URL of the running requester agent.
+    # Since we are running it locally, we can hardcode it.
+    requester_port = 8001  # Assuming the requester runs on this port
+    REQUESTER_ENDPOINT = f"http://localhost:{requester_port}"
+
+    # --- 1. Discover the worker agent ---
+    task_description = "Please write a poem about butterflies."
+    try:
+        worker_name, worker_url = find_best_agent(REGISTRY_URL, task_description)
+        print(f"Found worker agent '{worker_name}' at {worker_url}")
+    except (requests.RequestException, RuntimeError) as e:
+        print(f"Error finding worker agent: {e}")
+        return
+
+    # --- 2. Create the initial task for the worker ---
+    correlation_id = str(uuid.uuid4())
+
+    callback_info = {
+        "endpoint": REQUESTER_ENDPOINT + "/a2a/tasks/send",
+        "data": {
+            "message": {
+                "role": "system",
+                "content": {
+                    "type": "text",
+                    "text": f"Final result for task {correlation_id}",
+                },
+            },
+        },
+    }
+
+    initial_task = Task(
+        message=Message(
+            role=MessageRole.USER,
+            content=TextContent(text=task_description),
+        ).to_dict(),
+        metadata={"callback_task": callback_info},  # Embed callback info here
+    )
+
+    # --- 3. Send the task to the worker ---
+    try:
+        print(f"Sending task to worker at {worker_url}")
+        worker_endpoint = f"{worker_url}/a2a/tasks/send"
+
+        response = requests.post(worker_endpoint, json=initial_task.to_dict())
+        response.raise_for_status()
+        sent_task_data = response.json()
+        print(f"Task {sent_task_data.get('id')} sent to worker. Awaiting callback.")
+    except requests.RequestException as e:
+        print(f"Error sending task to worker: {e}")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+
+
+#### Worker
+
+```python
+def _finish_and_callback(self, task: Task):
+    # Simulate a long-running job
+    long_task_duration_secs = 10
+    time.sleep(long_task_duration_secs)
+
+    # --- Job is done, prepare the callback task ---
+    callback_info = task.metadata.get("callback_task", {})
+    callback_endpoint = callback_info.get("endpoint")
+    callback_headers = callback_info.get("headers", {})
+    callback_data = callback_info.get("data", {})
+
+    if not callback_endpoint:
+        logger.error("Callback endpoint not found in task metadata.")
+        return
+
+    # Create a new A2A client to communicate with the requester
+    requester_client = A2AClient(
+        callback_endpoint.split("/a2a/")[0],
+        headers=callback_headers,
+    )
+
+    # Create the task to send back with the final result
+    result_task = Task(**callback_data)
+    result_task.artifacts = [
+        {
+            "parts": [
+                {
+                    "type": "text",
+                    "text": f"Completed the analysis in {long_task_duration_secs} seconds.",
+                }
+            ]
+        }
+    ]
+
+    # Send the final result back to the requester
+    requester_client._send_task(result_task)
+    print("Callback sent to the requester.")
+
+def handle_task(self, task: Task):
+    print(task)
+    if task.metadata and "callback_task" in task.metadata:
+        print("Received a task with a callback. Starting background job.")
+        # Start the long-running job in a separate thread
+        threading.Thread(
+            target=self._finish_and_callback, args=(task,), daemon=True
+        ).start()
+
+        # Immediately confirm that the task is being processed
+        task.status = TaskStatus(state=TaskState.WAITING)
+        return task
+    else:
+        # Handle a regular task without a callback
+        print("Received a regular task.")
+        task.status = TaskStatus(state=TaskState.COMPLETED)
+        task.artifacts = [
+            {
+                "parts": [
+                    {"type": "text", "text": "Task processed without callback."}
+                ]
+            }
+        ]
+        return task
+```
+
+#### Requester
+
+```python
+def handle_message(self, message: Message) -> Message:
+    """
+    if method handle_task exists, it will be called instead of handle_message
+    """
+    print(message)
+    return None
 ```
