@@ -134,7 +134,9 @@ class SampleAgent(A2AServer):
             )
 
     def handle_message(self, message: Message) -> Message:
-        # response = client.send_message("What is the meaning of life?")
+        """
+        if method handle_task exists, it will be called instead of handle_message
+        """
         return Message(
             content=TextContent(
                 text=f"Hello from {self.agent_card.name}! I received: {message.content.text}"
@@ -145,6 +147,9 @@ class SampleAgent(A2AServer):
         )
 
     def process_message(self, message: Message) -> Message:
+        """
+        make sure not to use this method, it is deprecated
+        """
         print(message)
         return "dupa"
 
