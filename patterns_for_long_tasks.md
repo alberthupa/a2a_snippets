@@ -426,7 +426,7 @@ This is already proven by your code: if you launch only **one** instance of the 
 ```mermaid
 sequenceDiagram
     participant Human
-    participant ConvAgent as Conversation&nbsp;Agent (client and requester)
+    participant ConversationAgent
     participant Worker
 
     Human->>ConvAgent: Normal chat…
