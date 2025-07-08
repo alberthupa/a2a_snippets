@@ -227,7 +227,7 @@ sequenceDiagram
     Note over Worker: Process long-running task...
 
     Worker->>+Requester: Send completed Task(Message, Artifacts) to callback URL
-    Reques
+    Requester-->>-Worker: Acknowledge callback
 ```
 
 
