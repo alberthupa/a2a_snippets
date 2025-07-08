@@ -399,3 +399,141 @@ def handle_message(self, message: Message) -> Message:
     print(message)
     return None
 ```
+
+
+# Combining Client and Requester into a Single A2A Agent  
+
+This document summarises how **one agent can play the dual role of “client” and “requester”** while off-loading heavy work to a background worker, yet continuing its conversation with the human user.  It draws on patterns from the *python-a2a* Context7 documentation (“Streaming Responses”, “Handling Asynchronous Tasks”, etc.) and the three example scripts you already built (`long_work_callback_client.py`, `long_work_callback_requester.py`, `long_work_callback_worker.py`).
+
+---
+
+## 1. Can the same agent be both Client *and* Requester?  
+**Yes.** The A2A protocol does not require the requester endpoint to live on a separate process.  
+What matters is that the worker receives (1) a callback URL and (2) any payload it should POST back when finished.  
+Therefore:
+
+* The *conversation agent* exposes the normal A2A endpoints (`/a2a/tasks/send`, `/a2a/agent.json`, …).  
+* When it needs long-running work it **creates an `A2AClient` pointing to the worker**, sends a task, and includes its **own** callback address (`http://…/a2a/tasks/send`) in `metadata.callback_task.endpoint`.  
+* While waiting, the agent continues talking to the human (streaming or immediate replies).  
+* The worker posts the completed task back to the same endpoint; the conversation agent’s `handle_task` receives it and can push the result to the user.
+
+This is already proven by your code: if you launch only **one** instance of the requester script and reuse its port in `long_work_callback_client.py`, that single process plays both roles.
+
+---
+
+## 2. High-Level Control Flow  
+
+```mermaid
+sequenceDiagram
+    participant Human
+    participant ConvAgent as Conversation&nbsp;Agent (client + requester)
+    participant Worker
+
+    Human->>ConvAgent: Normal chat…
+
+    alt Simple question
+        ConvAgent-->>Human: Immediate answer
+    else Heavy sub-task
+        ConvAgent->>Worker: Task + callback=http://conv:port/a2a/tasks/send
+        ConvAgent-->>Human: “I’m on it, will get back to you…”
+        note over Human,ConvAgent: ↔ normal chat can continue
+        Worker->>ConvAgent: Completed task (POST to callback)
+        ConvAgent-->>Human: Final result / artefacts
+    end
+```
+
+Key points  
+1. **Threading / asyncio** – do the worker call in a background task so `handle_message` returns quickly.  
+2. **Task correlation** – include a `correlation_id` in the callback payload or reuse `task.id` so the agent can map the worker result to the right chat context.  
+3. **Streaming to user** – use the *python-a2a* “Streaming Agent” pattern to update progress if desired.
+
+---
+
+## 3. Minimal Skeleton (single process)  
+
+```python
+class ConversationalAgent(A2AServer):
+    def __init__(self, port, registry_url):
+        super().__init__(agent_card=AgentCard(
+            name="Conversation Agent",
+            description="Talks to user and farms out heavy jobs",
+            url=f"http://localhost:{port}",
+            version="1.0.0",
+            capabilities={"streaming": True}
+        ))
+        self.registry_url = registry_url
+        self.pending = {}          # task_id -> conversation_id
+        enable_discovery(self, registry_url)
+
+    def handle_message(self, msg: Message) -> Message:
+        if "please compute" in msg.content.text.lower():
+            # 1. Send sub-task
+            worker_url = pick_worker(self.registry_url)
+            client = A2AClient(worker_url)
+            task = Task(
+                message=Message(role=MessageRole.USER,
+                                content=TextContent(text="heavy stuff")).to_dict(),
+                metadata={"callback_task": {
+                    "endpoint": f"{self.agent_card.url}/a2a/tasks/send",
+                    "data": {"message": {
+                        "role": "system",
+                        "content": {"type": "text", "text": "Worker result"}
+                    }}
+                }}
+            )
+            self.pending[task.id] = msg.conversation_id
+            threading.Thread(target=client._send_task, args=(task,), daemon=True).start()
+            return Message(role=MessageRole.AGENT,
+                           content=TextContent(text="Working on it…"),
+                           parent_message_id=msg.message_id,
+                           conversation_id=msg.conversation_id)
+
+        # Normal answer
+        return Message(role=MessageRole.AGENT,
+                       content=TextContent(text="Here is a quick answer"),
+                       parent_message_id=msg.message_id,
+                       conversation_id=msg.conversation_id)
+
+    def handle_task(self, task: Task):
+        """Called when worker POSTs result back."""
+        conv_id = self.pending.pop(task.id, None)
+        if conv_id:
+            # relay result as new message
+            self.push_message_to_user(
+                Message(role=MessageRole.AGENT,
+                        content=TextContent(text=task.artifacts[0]["parts"][0]["text"]),
+                        conversation_id=conv_id))
+        task.status.state = TaskState.COMPLETED
+        return task
+```
+
+*(Push implementation depends on your UI — could be SSE, WebSocket, or just the next HTTP poll.)*
+
+---
+
+## 4. Worker Implementation  
+Your existing `long_work_callback_worker.py` already matches the Context7 “Streaming Responses” example:
+
+* sets `TaskStatus(WAITING)` immediately,
+* sleeps / processes,
+* POSTs back to the provided callback URL with final artefacts.
+
+No changes needed.
+
+---
+
+## 5. Conversation Continuity Tips  
+
+| Concern | Solution |
+| --- | --- |
+| **Blocking** | Spawn a thread or `asyncio.create_task` when calling the worker. |
+| **Progress updates** | Send intermediate artefacts from worker or keep-alive messages from the conversation agent. |
+| **Multiple overlapping jobs** | Maintain `self.pending` map keyed by task ID. |
+| **Reconnect-after-refresh** | Persist the map in a DB or cache if the agent restarts. |
+
+---
+
+## 6. Conclusion  
+
+*Using the callback pattern in python-a2a, a single agent can seamlessly play both **client** (initiator of work) and **requester** (recipient of callback).*  
+This reduces deployment complexity (fewer ports / services) while retaining full duplex conversation with the user.
